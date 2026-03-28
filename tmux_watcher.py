@@ -138,7 +138,7 @@ def run_command(cmd: list[str], name: str, log_file: Path, progress_min: int) ->
 
 
 def main() -> None:
-    progress_min = 1
+    progress_min = 30
     monitor_session_name = None
     foreground = False
     argv = sys.argv[1:]
