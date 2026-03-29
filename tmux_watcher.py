@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Wrapper that runs a command, logs output, and notifies Discord when done.
 
+Progress notifications are exponential: 1m, 5m, 25m, 125m, ... (capped at 8h).
+
 Usage:
     # Run mode: spawn a command, log output, notify when done
-    tmux_watcher.py [--progress MINUTES] "task name" -- command arg1 arg2 ...
+    tmux_watcher.py "task name" -- command arg1 arg2 ...
 
     # Monitor mode: watch an existing tmux session, log its output, notify when it ends
-    tmux_watcher.py [--progress MINUTES] --monitor SESSION_NAME "task name"
+    tmux_watcher.py --monitor SESSION_NAME "task name"
 
 Examples:
-    tmux new-session -d -s upload-l003 \
-        'python3 ~/kv/tmux-watcher/tmux_watcher.py --progress 15 "L003 upload" -- rclone copy /src gdrive:dest'
-
-    python3 ~/kv/tmux-watcher/tmux_watcher.py --progress 5 --monitor dispatcher "72 bulk download"
+    python3 ~/kv/public-scripts/tmux_watcher.py "L003 upload" -- rclone copy /src gdrive:dest
+    python3 ~/kv/public-scripts/tmux_watcher.py --monitor dispatcher "72 bulk download"
 
 Logs to: ~/kv/tmux-watcher/logs/<slugified-name>.log
 """
@@ -52,10 +52,13 @@ def post_discord(title: str, body: str, color: int) -> None:
     })
 
 
-def progress_loop(name: str, log_file: Path, interval_sec: int, stop_event: threading.Event) -> None:
-    while not stop_event.wait(interval_sec):
+def progress_loop(name: str, log_file: Path, stop_event: threading.Event) -> None:
+    interval_min = 1
+    max_interval_min = 480  # 8 hours
+    while not stop_event.wait(interval_min * 60):
         tail = read_tail(log_file)
-        post_discord(f"[{HOSTNAME}] {name} (in progress)", tail, 0x3498DB)
+        post_discord(f"[{HOSTNAME}] {name} (in progress, next in {interval_min * 5}m)", tail, 0x3498DB)
+        interval_min = min(interval_min * 5, max_interval_min)
 
 
 def tmux_session_alive(session: str) -> bool:
@@ -71,7 +74,7 @@ def tmux_capture_pane(session: str) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
-def monitor_session(session: str, name: str, log_file: Path, progress_min: int) -> None:
+def monitor_session(session: str, name: str, log_file: Path) -> None:
     print(f"[tmux-watcher] Monitoring tmux session: {session}", flush=True)
     print(f"[tmux-watcher] Log: {log_file}", flush=True)
 
@@ -81,10 +84,9 @@ def monitor_session(session: str, name: str, log_file: Path, progress_min: int) 
         return
 
     stop_event = threading.Event()
-    if progress_min:
-        print(f"[tmux-watcher] Progress updates every {progress_min}m", flush=True)
-        t = threading.Thread(target=progress_loop, args=(name, log_file, progress_min * 60, stop_event), daemon=True)
-        t.start()
+    print("[tmux-watcher] Progress: 1m, 5m, 25m, 125m, ... (exponential, cap 8h)", flush=True)
+    t = threading.Thread(target=progress_loop, args=(name, log_file, stop_event), daemon=True)
+    t.start()
 
     prev_content = ""
     while tmux_session_alive(session):
@@ -102,12 +104,11 @@ def monitor_session(session: str, name: str, log_file: Path, progress_min: int) 
     print("[tmux-watcher] Discord notified", flush=True)
 
 
-def run_command_foreground(cmd: list[str], name: str, log_file: Path, progress_min: int) -> None:
+def run_command_foreground(cmd: list[str], name: str, log_file: Path) -> None:
     """Actually run the command (called inside the tmux session)."""
     stop_event = threading.Event()
-    if progress_min:
-        t = threading.Thread(target=progress_loop, args=(name, log_file, progress_min * 60, stop_event), daemon=True)
-        t.start()
+    t = threading.Thread(target=progress_loop, args=(name, log_file, stop_event), daemon=True)
+    t.start()
 
     with open(log_file, "w") as f:
         result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
@@ -121,31 +122,30 @@ def run_command_foreground(cmd: list[str], name: str, log_file: Path, progress_m
     post_discord(f"[{HOSTNAME}] {name} {status}", tail, color)
 
 
-def run_command(cmd: list[str], name: str, log_file: Path, progress_min: int) -> None:
+def run_command(cmd: list[str], name: str, log_file: Path) -> None:
     """Spawn a tmux session that runs the command, then return immediately."""
     session_name = slugify(name)
 
     # NOTE: re-invoke ourselves with --_foreground inside the tmux session
-    watcher_cmd = [sys.executable, __file__, "--progress", str(progress_min), "--_foreground", name, "--"] + cmd
+    watcher_cmd = [sys.executable, __file__, "--_foreground", name, "--"] + cmd
     tmux_cmd = ["tmux", "new-session", "-d", "-s", session_name, " ".join(f"'{a}'" for a in watcher_cmd)]
 
     subprocess.run(tmux_cmd, check=True)
 
     print(f"[tmux-watcher] Started tmux session: {session_name}", flush=True)
     print(f"[tmux-watcher] Log: {log_file}", flush=True)
-    print(f"[tmux-watcher] Progress updates every {progress_min}m", flush=True)
+    print(f"[tmux-watcher] Progress: 1m, 5m, 25m, 125m, ... (exponential, cap 8h)", flush=True)
     print(f"[tmux-watcher] Attach with: tmux attach -t {session_name}", flush=True)
 
 
 def main() -> None:
-    progress_min = 30
     monitor_session_name = None
     foreground = False
     argv = sys.argv[1:]
 
+    # NOTE: --progress is accepted but ignored (kept for backwards compat)
     if "--progress" in argv:
         idx = argv.index("--progress")
-        progress_min = int(argv[idx + 1])
         argv = argv[:idx] + argv[idx + 2:]
 
     if "--monitor" in argv:
@@ -163,12 +163,12 @@ def main() -> None:
     if monitor_session_name:
         name = " ".join(argv) if argv else monitor_session_name
         log_file = LOG_DIR / f"{slugify(name)}.log"
-        monitor_session(monitor_session_name, name, log_file, progress_min)
+        monitor_session(monitor_session_name, name, log_file)
         return
 
     if "--" not in argv:
-        print(f"Usage: {sys.argv[0]} [--progress MIN] \"name\" -- cmd ...")
-        print(f"       {sys.argv[0]} [--progress MIN] --monitor SESSION \"name\"")
+        print(f"Usage: {sys.argv[0]} \"name\" -- cmd ...")
+        print(f"       {sys.argv[0]} --monitor SESSION \"name\"")
         sys.exit(1)
 
     sep = argv.index("--")
@@ -176,14 +176,14 @@ def main() -> None:
     cmd = argv[sep + 1:]
 
     if not name or not cmd:
-        print(f"Usage: {sys.argv[0]} [--progress MIN] \"name\" -- cmd ...")
+        print(f"Usage: {sys.argv[0]} \"name\" -- cmd ...")
         sys.exit(1)
 
     log_file = LOG_DIR / f"{slugify(name)}.log"
     if foreground:
-        run_command_foreground(cmd, name, log_file, progress_min)
+        run_command_foreground(cmd, name, log_file)
     else:
-        run_command(cmd, name, log_file, progress_min)
+        run_command(cmd, name, log_file)
 
 
 if __name__ == "__main__":
